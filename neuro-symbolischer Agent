@@ -1,0 +1,370 @@
+import networkx as nx
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+from networkx.algorithms import community
+import random
+import os
+import time
+import google.generativeai as genai
+
+# --- KONFIGURATION ---
+# Ersetze das hier durch deinen echten API Key!
+API_KEY = "DEIN_GOOGLE_API_KEY_HIER" 
+
+# Wir nutzen das Flash-Modell für Geschwindigkeit
+MODEL_NAME = "gemini-1.5-flash" 
+
+if not os.path.exists("brain_snapshots"):
+    os.makedirs("brain_snapshots")
+
+class GeminiBrain:
+    def __init__(self):
+        self.graph = nx.DiGraph() 
+        self.step = 0
+        
+        # Gemini Setup
+        if API_KEY == "DEIN_GOOGLE_API_KEY_HIER":
+            print("⚠️ ACHTUNG: Du musst deinen API Key im Code eintragen!")
+        else:
+            genai.configure(api_key=API_KEY)
+            self.model = genai.GenerativeModel(MODEL_NAME)
+        
+        plt.ion() 
+        self.fig = plt.figure(figsize=(12, 9))
+        
+        self.stopwords = set([
+            "der", "die", "das", "ein", "eine", "ist", "sind", "hat", "haben",
+            "und", "oder", "aber", "mit", "von", "zu", "in", "im", "am", "auf",
+            "er", "sie", "es", "ich", "du", "sehr", "ziemlich", "ganz", "den"
+        ])
+
+    # --- GEMINI SCHNITTSTELLE ---
+    def ask_gemini(self, concept):
+        """Fragt Gemini nach dem Oberbegriff."""
+        print(f"      📡 Frage Gemini: Was ist '{concept}'? ...")
+        
+        try:
+            # Der Prompt zwingt Gemini zu einer Ein-Wort-Antwort
+            prompt = (
+                f"Du bist eine Datenbank-KI. Ordne den Begriff '{concept}' einer direkten Oberkategorie zu. "
+                f"Antworte mit genau einem einzigen Wort (Substantiv) auf Deutsch. "
+                f"Beispiel: Apfel -> Obst. "
+                f"Wenn der Begriff abstrakt ist (wie Raum, Zeit, Existenz), antworte mit 'Unbekannt'."
+                f"Antworte nur mit dem Wort, keine Satzzeichen."
+            )
+            
+            response = self.model.generate_content(prompt)
+            answer = response.text.strip().replace(".", "")
+            
+            print(f"      🤖 Gemini antwortet: '{answer}'")
+            return answer
+        except Exception as e:
+            print(f"      ❌ API Fehler: {e}")
+            return "Unbekannt"
+
+    # --- GRAPH FUNKTIONEN ---
+    def get_highest_prio_node(self, label):
+        candidates = [n for n, attr in self.graph.nodes(data=True) if attr.get('label') == label]
+        if not candidates: return None
+        candidates.sort(key=lambda n: self.graph.nodes[n]['priority'], reverse=True)
+        return candidates[0]
+
+    def add_node(self, label, category="konzept", priority=1.0):
+        node_id = f"{label}_{self.step}_{int(priority*100)}_{random.randint(0,999)}"
+        self.graph.add_node(node_id, label=label, priority=priority, category=category)
+        return node_id
+
+    def decouple_node(self, parent_id):
+        parent_data = self.graph.nodes[parent_id]
+        prio = parent_data['priority']
+        label = parent_data['label']
+        cat = parent_data.get('category', 'konzept')
+        
+        neighbors = list(self.graph.neighbors(parent_id)) + list(self.graph.predecessors(parent_id))
+        count = max(1, len(set(neighbors))) 
+        
+        share = prio / count
+        child_prio = share + 1
+        parent_new_prio = max(0.1, prio - share)
+        
+        # print(f"   🧬 Abkapselung: {label} ({prio:.1f}) -> Kind ({child_prio:.1f})")
+        self.graph.nodes[parent_id]['priority'] = parent_new_prio
+        
+        child_id = self.add_node(label, category=cat, priority=child_prio)
+        self.graph.add_edge(parent_id, child_id, relation="cluster", color="gray", style="dotted", status="cluster")
+        return child_id
+
+    def check_and_merge_clusters(self, label):
+        nodes = [n for n, attr in self.graph.nodes(data=True) if attr.get('label') == label]
+        if len(nodes) < 2: return
+
+        nodes.sort(key=lambda n: self.graph.nodes[n]['priority'], reverse=True)
+        i = 0
+        while i < len(nodes) - 1:
+            n1 = nodes[i]
+            n2 = nodes[i+1]
+            p1 = self.graph.nodes[n1]['priority']
+            p2 = self.graph.nodes[n2]['priority']
+            
+            if abs(p1 - p2) < 0.1:
+                # print(f"   🔥 Verschmelzung: {n1} + {n2}")
+                self.graph.nodes[n1]['priority'] = p1 + p2
+                for pred in self.graph.predecessors(n2):
+                    if pred != n1:
+                        data = self.graph.get_edge_data(pred, n2)
+                        if not self.graph.has_edge(pred, n1): self.graph.add_edge(pred, n1, **data)
+                for succ in self.graph.successors(n2):
+                    if succ != n1:
+                        data = self.graph.get_edge_data(n2, succ)
+                        if not self.graph.has_edge(n1, succ): self.graph.add_edge(n1, succ, **data)
+                self.graph.remove_node(n2)
+                nodes = [n for n, attr in self.graph.nodes(data=True) if attr.get('label') == label]
+                nodes.sort(key=lambda n: self.graph.nodes[n]['priority'], reverse=True)
+                i = 0 
+            else:
+                i += 1
+
+    # --- GROUNDING MIT GEMINI ---
+    def ensure_grounding(self, concept_label):
+        """Der automatisierte Grounding Loop"""
+        
+        # Prüfen ob schon bekannt
+        existing_nodes = [n for n, attr in self.graph.nodes(data=True) if attr.get('label') == concept_label]
+        for n in existing_nodes:
+            if self.graph.degree(n) > 0: return
+
+        print(f"   🔍 Grounding startet für: '{concept_label}'")
+        current_concept = concept_label
+        depth = 0
+        
+        while depth < 10: # Sicherheits-Limit für die API
+            depth += 1
+            
+            # API AUFRUF STATT INPUT
+            answer = self.ask_gemini(current_concept)
+            
+            if answer.lower() in ["unbekannt", "stop", "egal", ""]:
+                self.add_node(current_concept, priority=5.0, category="fundament")
+                print(f"      🛑 Fundament erreicht: {current_concept}")
+                break
+            
+            # Wir lernen die Definition klassisch
+            def_node = self.get_highest_prio_node(answer)
+            if not def_node: def_node = self.add_node(answer, priority=5.0, category="kategorie")
+            
+            # Neuen Begriff anlegen
+            new_node_id = self.add_node(current_concept, priority=2.0)
+            
+            self.graph.add_edge(new_node_id, def_node, relation="ist ein", color="black", status="real")
+            
+            # Prüfen ob die Antwort (z.B. "Obst") schon bekannt ist
+            existing_parent = [n for n, attr in self.graph.nodes(data=True) if attr.get('label') == answer]
+            is_known = False
+            for ep in existing_parent:
+                if self.graph.degree(ep) > 1: # Mehr als nur die Verbindung zu uns
+                    is_known = True
+            
+            if is_known:
+                print(f"      ✅ Anschluss gefunden: {answer} ist bekannt.")
+                break
+            
+            # Rekursion
+            current_concept = answer
+            self.visualize(f"Lerne: {current_concept}")
+            time.sleep(0.5) # Kurz warten für die API Rate Limits
+
+    # --- LOGIK & VERARBEITUNG ---
+    def connect_concepts(self, source_label, target_label, relation, source_cat="konzept", target_cat="konzept"):
+        # A) Traum Check
+        src_nodes = [n for n, attr in self.graph.nodes(data=True) if attr.get('label') == source_label]
+        tgt_nodes = [n for n, attr in self.graph.nodes(data=True) if attr.get('label') == target_label]
+        
+        for s in src_nodes:
+            for t in tgt_nodes:
+                if self.graph.has_edge(s, t):
+                    edge = self.graph[s][t]
+                    if edge.get('status') == 'dream':
+                        print(f"   😲 DÉJÀ-VU! Traum bestätigt: {source_label} -> {target_label}")
+                        edge['status'] = 'confirmed_dream'
+                        edge['color'] = 'gold'
+                        self.graph.nodes[s]['priority'] += 1.0
+                        self.graph.nodes[t]['priority'] += 1.0
+                        return
+
+        # B) Normales Verbinden (Cluster Logic)
+        src_parent = self.get_highest_prio_node(source_label)
+        tgt_parent = self.get_highest_prio_node(target_label)
+
+        if not src_parent: src_parent = self.add_node(source_label, category=source_cat, priority=5.0)
+        if not tgt_parent: tgt_parent = self.add_node(target_label, category=target_cat, priority=5.0)
+
+        if self.graph.has_edge(src_parent, tgt_parent):
+             self.graph.nodes[src_parent]['priority'] += 0.2
+             return
+
+        real_src = self.decouple_node(src_parent)
+        real_tgt = self.decouple_node(tgt_parent)
+        
+        # print(f"   ✅ Verbinde: {source_label} --[{relation}]--> {target_label}")
+        self.graph.add_edge(real_src, real_tgt, relation=relation, color="black", style="solid", status="real")
+
+        self.check_and_merge_clusters(source_label)
+        self.check_and_merge_clusters(target_label)
+
+    def parse_and_process(self, text):
+        print(f"\n--- INPUT: '{text}' ---")
+        self.step += 1
+        
+        words = text.replace(".", "").split()
+        clean = [w for w in words if w.lower() not in self.stopwords]
+        if not clean: return self.dream_mode()
+
+        # Heuristik Parsing
+        subj, props, state, details = None, [], None, []
+        subj_idx = -1
+        for i, w in enumerate(clean):
+            if w[0].isupper():
+                subj = w
+                subj_idx = i
+                break
+        if not subj: subj, subj_idx = clean[0], 0
+        props = clean[:subj_idx]
+        if len(clean) > subj_idx + 1: state = clean[subj_idx+1]
+        if len(clean) > subj_idx + 2: details = clean[subj_idx+2:]
+
+        print(f"   🛠️  Struktur: O={subj} | E={props} | Z={state}")
+
+        # --- GROUNDING VIA GEMINI ---
+        self.ensure_grounding(subj)
+        for p in props: self.ensure_grounding(p)
+        if state: self.ensure_grounding(state)
+        for d in details: self.ensure_grounding(d)
+
+        # --- VERBINDEN ---
+        self.add_node(subj, category='objekt') # Kategorie Marker setzen
+        
+        for p in props:
+            self.connect_concepts(subj, p, "ist", source_cat="objekt", target_cat="eigenschaft")
+        
+        if state:
+            self.connect_concepts(subj, state, "tut", source_cat="objekt", target_cat="zustand")
+            for d in details:
+                rel = "bei/mit" if d[0].isupper() else "wie?"
+                t_cat = "objekt" if d[0].isupper() else "eigenschaft"
+                self.connect_concepts(state, d, rel, source_cat="zustand", target_cat=t_cat)
+
+        self.visualize(f"Gelernt: {text}")
+        self.dream_mode()
+
+    def dream_mode(self):
+        nodes = list(self.graph.nodes())
+        if len(nodes) < 5: return
+
+        print("\n--- 🌙 TRAUMPHASE ---")
+        for _ in range(2):
+            u_id = random.choice(nodes)
+            v_id = random.choice(nodes)
+            
+            u_data = self.graph.nodes[u_id]
+            v_data = self.graph.nodes[v_id]
+
+            if u_id != v_id and u_data['label'] != v_data['label'] and not self.graph.has_edge(u_id, v_id):
+                print(f"   💭 TRAUM: Verbindung '{u_data['label']}' <-> '{v_data['label']}'?")
+                self.graph.add_edge(u_id, v_id, relation="?", status="dream", priority=0.1, color="lightgray", style="dashed")
+        
+        self.visualize("Träumt...")
+
+    def process_query(self, text):
+        print(f"\n🔍 SUCHE NACH: '{text}'")
+        words = text.replace("?", "").replace(".", "").split()
+        keywords = [w for w in words if w.lower() not in self.stopwords]
+        
+        if not keywords: return
+
+        found_any = False
+        for kw in keywords:
+            matches = [n for n, attr in self.graph.nodes(data=True) if attr.get('label') == kw]
+            if matches:
+                found_any = True
+                matches.sort(key=lambda n: self.graph.nodes[n]['priority'], reverse=True)
+                best = matches[0]
+                prio = self.graph.nodes[best]['priority']
+                print(f"   ✨ TREFFER: '{kw}' (Prio {prio:.2f})")
+                
+                # Zeige Fakten (Keine Träume)
+                for node_variant in matches:
+                    for neighbor in self.graph.successors(node_variant):
+                        edge = self.graph.get_edge_data(node_variant, neighbor)
+                        if edge.get('status') != 'dream':
+                            tgt_label = self.graph.nodes[neighbor]['label']
+                            print(f"      --{edge['relation']}--> {tgt_label}")
+            else:
+                print(f"   ❌ '{kw}' ist unbekannt.")
+
+    def visualize(self, title):
+        self.fig.clf()
+        try:
+            pos = nx.spring_layout(self.graph, seed=42, k=0.9, iterations=50)
+        except:
+            pos = nx.random_layout(self.graph)
+            
+        # Cluster Farben berechnen
+        node_colors = ['lightblue'] * len(self.graph.nodes)
+        if len(self.graph.nodes) > 5:
+            try:
+                communities = community.greedy_modularity_communities(self.graph.to_undirected())
+                cmap = cm.get_cmap('tab10', len(communities))
+                color_map = {}
+                for i, comm in enumerate(communities):
+                    for node in comm:
+                        color_map[node] = cmap(i)
+                node_colors = [color_map.get(n, 'lightblue') for n in self.graph.nodes]
+                # Hohe Prio überschreibt Cluster mit GOLD
+                for i, n in enumerate(self.graph.nodes):
+                    if self.graph.nodes[n]['priority'] >= 5.0:
+                        node_colors[i] = "#FFD700"
+            except: pass
+
+        sizes = [self.graph.nodes[n]['priority'] * 300 + 200 for n in self.graph.nodes]
+        labels = {n: f"{attr['label']}" for n, attr in self.graph.nodes(data=True)}
+
+        edges = self.graph.edges(data=True)
+        edge_colors = [d.get('color', 'black') for u, v, d in edges]
+        styles = [d.get('style', 'solid') for u, v, d in edges]
+        widths = [2.0 if d.get('color')=='gold' else 1.0 for u, v, d in edges]
+
+        nx.draw_networkx_nodes(self.graph, pos, node_color=node_colors, node_size=sizes, edgecolors='black')
+        nx.draw_networkx_labels(self.graph, pos, labels=labels, font_size=8, font_weight='bold')
+        nx.draw_networkx_edges(self.graph, pos, edge_color=edge_colors, style=styles, width=widths, arrowsize=15)
+        
+        edge_labels = { (u,v): d['relation'] for u,v,d in edges if d.get('relation') and "?" not in d['relation'] and d.get('relation') != 'cluster'}
+        nx.draw_networkx_edge_labels(self.graph, pos, edge_labels=edge_labels, font_size=7)
+
+        plt.title(title)
+        plt.draw()
+        plt.pause(0.1)
+
+# --- START ---
+brain = GeminiBrain()
+
+print("--- GEMINI-POWERED BRAIN ---")
+print("1. Gib Sätze ein (z.B. 'Der rote Apfel fällt').")
+print("2. Gemini beantwortet automatisch 'Was ist Apfel?'.")
+print("3. Die KI clustert und träumt.")
+print("4. Frage mit '? Apfel' nach Wissen.")
+
+while True:
+    try:
+        user_input = input("\n>> ").strip()
+        if user_input.lower() == "exit": break
+        if not user_input: 
+            brain.dream_mode()
+            continue
+
+        if user_input.startswith("?"):
+            brain.process_query(user_input[1:])
+        else:
+            brain.parse_and_process(user_input)
+
+    except Exception as e:
+        print(f"Fehler: {e}")
